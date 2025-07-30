@@ -1,0 +1,109 @@
+version: '3.9'
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - kafka-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: ${KAFKA_ZOOKEEPER_CONNECT}
+      KAFKA_ADVERTISED_LISTENERS: ${KAFKA_ADVERTISED_LISTENERS}
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: ${KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR}
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_CONFLUENT_SUPPORT_METRICS_ENABLE: 'false'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: ${KAFKA_LISTENER_SECURITY_PROTOCOL_MAP}
+      KAFKA_LISTENERS: ${KAFKA_LISTENERS}
+    networks:
+      - kafka-net
+
+  spark:
+    build:
+      context: .
+      dockerfile: spark/Dockerfile
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=${SPARK_MASTER_HOST}
+      - SPARK_MASTER_PORT=${SPARK_MASTER_PORT}
+      - SPARK_UI_PORT=${SPARK_UI_PORT}
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    volumes:
+      - ./spark/spark_app:/opt/spark-apps
+      - ./spark/checkpoint:/opt/spark/spark-checkpoints
+    networks:
+      - kafka-net
+    
+  spark-worker:
+    build:
+      context: .
+      dockerfile: spark/Dockerfile
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://${SPARK_MASTER_HOST}:${SPARK_MASTER_PORT}
+      - SPARK_WORKER_PORT=${SPARK_WORKER_PORT}
+    depends_on:
+      - spark
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./spark/spark_app:/opt/spark-apps
+      - ./spark/checkpoint:/opt/spark/spark-checkpoints
+    networks:
+      - kafka-net
+
+
+  postgres:
+    image: postgres:16.3
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - kafka-net
+
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - "8082:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    depends_on:
+      - kafka
+      - zookeeper
+    networks:
+      - kafka-net
+volumes:
+  pgdata:
+
+networks:
+  kafka-net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: kafka-net
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+      com.docker.network.bridge.host_binding_ipv4: "0.0.0.0"
+
+

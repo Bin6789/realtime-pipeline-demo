@@ -1,0 +1,14 @@
+# ignore system files
+*.log
+*.pyc
+__pycache__/
+
+jars/
+
+# ignore Spark & Kafka checkpoints
+checkpoint/
+logs/
+
+# ignore docker volumes or temp files
+*.db
+.env
