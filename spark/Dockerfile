@@ -14,7 +14,8 @@ RUN apt-get update && apt-get install -y python3-pip wget && \
 RUN pip3 install --no-cache-dir requests \
     elasticsearch==8.7.0 \
     kafka-python==2.0.2 \
-    psycopg2-binary==2.9.6 
+    psycopg2-binary==2.9.6 \
+    python-snappy==0.7.3
 
 # ================================
 # JAR cho Kafka, PostgreSQL, MinIO/S3

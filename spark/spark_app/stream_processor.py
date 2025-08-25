@@ -7,6 +7,7 @@ import json
 from typing import Dict, List
 from datetime import datetime, time
 
+import concurrent
 import psycopg2
 from psycopg2.extras import execute_values
 
@@ -40,12 +41,16 @@ ES_INDEX = os.getenv("ES_INDEX", "user_event_logs")
 CHECKPOINT_BASE = os.getenv("CHECKPOINT_BASE", "/opt/spark/spark-checkpoints/realtime")
 ANOMALY_THRESHOLD = int(os.getenv("ANOMALY_THRESHOLD", "5"))  # threshold for anomaly
 COPY_CHUNK = int(os.getenv("COPY_CHUNK", "5000"))  # number of rows per COPY chunk to avoid huge memory spike
+ES_BULK_CHUNK = int(os.getenv("ES_BULK_CHUNK", "2000"))
 
 # Windows / triggers
-PROCESSING_TRIGGER = os.getenv("PROCESSING_TRIGGER", "30 seconds")
-WINDOW_DURATION = os.getenv("WINDOW_DURATION", "1 minute")
-WINDOW_SLIDE = os.getenv("WINDOW_SLIDE", "30 seconds")
-WATERMARK = os.getenv("WATERMARK", "2 minutes")  # ~2 times per minute
+PROCESSING_TRIGGER = os.getenv("PROCESSING_TRIGGER", "1 seconds")
+WINDOW_DURATION_5S = "5 seconds"
+WINDOW_DURATION_1MIN = "1 minute"
+WINDOW_SLIDE = os.getenv("WINDOW_SLIDE", "5 seconds")
+WATERMARK_5S = "30 seconds"
+WATERMARK_1MIN = "2 minutes"
+Z_THRESHOLD = float(os.getenv("Z_THRESHOLD", "2.0"))
 
 # Logging
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -98,22 +103,11 @@ def get_es_client():
     global _es_client
     if _es_client is None:
         try:
-            _es_client = Elasticsearch([ES_HOST], timeout=10)
+            _es_client = Elasticsearch([ES_HOST], request_timeout=10)
         except Exception as e:
             logger.warning("ES client init failed: %s", e)
             _es_client = None
     return _es_client
-
-# def es_index_record(doc: dict, index: str = ES_INDEX):
-#     try:
-#         es = get_es_client()
-#          # compatibility: elasticsearch-py >=8 uses 'document'; older uses 'body'
-#         try:
-#              es.index(index=index, document=doc)
-#         except TypeError:
-#             es.index(index=index, body=doc)
-#     except Exception as e:
-#         print(f"[WARN] ES index failed: {e}")
 
 # ----------------------
 # Kafka producer helper (alerts & DLQ)
@@ -127,7 +121,8 @@ def get_alert_producer(max_retries=3, retry_delay=5):
                 _alert_producer = KafkaProducer(
                     bootstrap_servers=KAFKA_BROKER,
                     value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-                    api_version=(2, 8, 0)
+                    api_version=(2, 8, 0),
+                    compression_type="snappy"
                 )
                 logger.info("Kafka producer initialized successfully")
                 return _alert_producer
@@ -145,8 +140,16 @@ def get_alert_producer(max_retries=3, retry_delay=5):
 # ==========================
 spark = SparkSession.builder \
     .appName("StreamProcessor") \
+    .config("spark.sql.parquet.compression.codec", "snappy") \
+    .config("spark.sql.shuffle.partitions", "4") \
+    .config("spark.sql.streaming.fileSink.logCleanupDelay", "1 hours") \
     .getOrCreate()
 spark.sparkContext.setLogLevel("WARN")
+
+users_df = spark.read.jdbc(
+    url=POSTGRES_URL, table="users",
+    properties={"user": POSTGRES_USER, "password": POSTGRES_PASSWORD}
+).cache()
 
 # ==========================
 # Schema for incoming Kafka JSON
@@ -180,7 +183,8 @@ parsed = kafka_df.selectExpr("CAST(value AS STRING) as json_str") \
     .filter(col("data").isNotNull()) \
     .select("data.*") \
     .withColumn("event_time", col("timestamp")) \
-    .dropna(subset=["user_id", "product_id", "action", "event_time"])
+    .dropna(subset=["user_id", "product_id", "action", "event_time"]) \
+    .repartition("user_id")
 
 # Print schema for debugging
 logger.info("Parsed schema: %s", parsed.schema)
@@ -212,24 +216,30 @@ def row_to_copy_buffer(row: List, columns: List[str]) -> io.StringIO:
     return buf
 
 # Dead-letter: send chunk to DLQ
-def send_chunk_to_dlq(chunk_rows: List, batch_id: int, reason: str):
+def send_chunk_to_dlq(chunk_rows: List, batch_id: int, reason: str, max_retries=3):
     prod = get_alert_producer()
     if not prod:
         logger.warning("No Kafka producer for DLQ; dropping %d rows", len(chunk_rows))
+        with open("tmp/dlq.log", "a") as f:
+            for r in chunk_rows:
+                f.write(json.dumps({"reason": reason, "batch_id": batch_id, "row": r, "reported_at": datetime.utcnow().isoformat()}) + "\n")
         return
     if not chunk_rows:
         return
     logger.warning("Sending batch %d to DLQ: %s", batch_id, chunk_rows)
-    for r in chunk_rows:
-        msg = {"reason": reason, "batch_id": batch_id, "row": r, "reported_at": datetime.utcnow().isoformat()}
+    for attempt in range(max_retries):
         try:
-            prod.send(KAFKA_DLQ_TOPIC, msg)
+            for r in chunk_rows:
+                msg = {"reason": reason, "batch_id": batch_id, "row": r, "reported_at": datetime.utcnow().isoformat()}
+                prod.send(KAFKA_DLQ_TOPIC, msg)
+            prod.flush(timeout=5)
+            logger.info("Sent %d rows to DLQ", len(chunk_rows))
+            return
         except Exception as e:
-            logger.warning("Failed sending DLQ message: %s", e)
-    try:
-        prod.flush(timeout=5)
-    except Exception:
-        pass
+            logger.warning("DLQ attempt %d failed: %s", attempt + 1, e)
+            if attempt < max_retries - 1:
+                time.sleep(1)  # wait before retrying
+    logger.error("Failed to send %d rows to DLQ after %d attempts", len(chunk_rows), max_retries)
 
 def foreach_write_raw(batch_df, batch_id):
 
@@ -254,15 +264,6 @@ def foreach_write_raw(batch_df, batch_id):
             col("user_segment"),
             col("ip_address")
         )
-        # Collect in reasonable chunks to avoid driver OOM
-        count_est = df_to_write.count()
-        get_es_client() and get_es_client() and None
-        # es_index_record({
-        #     "type": "raw_batch_prepare",
-        #     "batch_id": batch_id,
-        #     "estimated_records": int(count_est),
-        #     "prepared_at": datetime.utcnow().isoformat()
-        # })
         
         # Convert partitions -> rows in chunks
         # Use .toLocalIterator() to avoid collecting all at once
@@ -317,13 +318,7 @@ def foreach_write_raw(batch_df, batch_id):
             try:
                 conn.close()
             except Exception:
-                pass
-            # es_index_record({
-            #     "type": "raw_batch",
-            #     "batch_id": batch_id,
-            #     "records": sent,
-            #     "logged_at": datetime.utcnow().isoformat()
-            # })    
+                pass  
     except Exception as e:
          logger.exception("[ERROR] write_raw_via_copy exception for batch %s: %s", batch_id, e)
 # Start raw stream
@@ -334,18 +329,32 @@ raw_query = parsed.writeStream \
     .option("checkpointLocation", f"{CHECKPOINT_BASE}/user_events") \
     .trigger(processingTime=PROCESSING_TRIGGER) \
     .start()
+    
+# ==========================
+# Write Parquet
+# ==========================
+parquet_query = parsed.writeStream \
+    .format("parquet") \
+    .option("path", "/tmp/parquet-logs") \
+    .option("checkpointLocation", f"{CHECKPOINT_BASE}/parquet") \
+    .trigger(processingTime=PROCESSING_TRIGGER) \
+    .start()
+
 
 # ==========================
 # WINDOWED AGGREGATION -> summary + anomaly detection
 # window: 1 minute, slide 30 seconds (short window as requested)
 # watermark: 2 minutes
 # ==========================
-windowed = parsed.withWatermark("event_time", WATERMARK) \
-    .groupBy(window(col("event_time"), WINDOW_DURATION, WINDOW_SLIDE), col("user_id")) \
+windowed_5s = parsed.withWatermark("event_time", WATERMARK_5S) \
+    .groupBy(window(col("event_time"), WINDOW_DURATION_5S, WINDOW_SLIDE), col("user_id")) \
+    .agg(count("*").alias("event_count"))
+windowed_1min = parsed.withWatermark("event_time", WATERMARK_1MIN) \
+    .groupBy(window(col("event_time"), WINDOW_DURATION_1MIN, WINDOW_SLIDE), col("user_id")) \
     .agg(count("*").alias("event_count"))
 
 
-def write_summary_and_anomaly(batch_df, batch_id):
+def write_summary_and_anomaly(batch_df, batch_id, window_type):
     """
     foreachBatch handler for aggregated windowed results.
     Writes summary into user_activity_summary via UPSERT, anomalies into anomalous_events (INSERT ON CONFLICT DO NOTHING),
@@ -353,28 +362,33 @@ def write_summary_and_anomaly(batch_df, batch_id):
     """
     try:
         if batch_df.rdd.isEmpty():
-            logger.info("[agg] Batch %s empty -> skip", batch_id)
+            logger.info("[agg] Batch %s (%s window) is empty -> skip", batch_id, window_type)
             return
         
    # materialize to local DF with proper columns
-        summary_df = batch_df.select(
+        summary_df = batch_df.coalesce(2).select(
             col("window").getField("start").alias("window_start"),
             col("window").getField("end").alias("window_end"),
             col("user_id"),
             col("event_count")
         )
         # convert to pandas or collect for psycopg2 upserts.
-        rows = summary_df.collect()
+        enriched_df = summary_df.join(users_df, "user_id", "left") \
+            .select(
+                col("window_start"), col("window_end"), col("user_id"), col("event_count"),
+                col("name").alias("user_name"), col("region")
+            )
+        rows = enriched_df.collect()
 
         if not rows:
-            logger.info("[agg] Batch %s has no summary rows -> skip", batch_id)
+            logger.info("[agg] Batch %s (%s window) has no summary rows -> skip", batch_id, window_type)
             return
 
         # Prepare data tuples for upsert
         upsert_tuples = []
         for r in rows:
             # window_start/end are TimestampType (py datetime)
-            ws = r["window_start"]  # Timestamp
+            ws = r["window_start"]
             we = r["window_end"]
             uid = int(r["user_id"])
             cnt = int(r["event_count"])
@@ -406,7 +420,7 @@ def write_summary_and_anomaly(batch_df, batch_id):
             """
             execute_values(cur, upsert_sql, upsert_tuples, page_size=200)
             conn.commit()
-            logger.info("[agg] Batch %s upserted %d summaries", batch_id, len(upsert_tuples))
+            logger.info("[agg] Batch %s (%s window) upserted %d summaries", batch_id, window_type, len(upsert_tuples))
         except Exception as e:
             conn.rollback()
             logger.exception("[ERROR] Failed upserting summaries for batch %s: %s", batch_id, e)
@@ -422,19 +436,22 @@ def write_summary_and_anomaly(batch_df, batch_id):
         # Detect anomalies: event_count > ANOMALY_THRESHOLD AND z-score > z_threshold
         anomalies = []
         
-        for (ws, we, uid, cnt) in upsert_tuples:
+        for i, (ws, we, uid, cnt) in enumerate(upsert_tuples):
             z = (cnt - mean) / stddev if stddev > 0 else None
-            is_anomaly = cnt > ANOMALY_THRESHOLD and (z is not None and z >= z_threshold)
+            logger.debug("User %d: event_count=%d, z_score=%s", uid, cnt, z)
+            is_anomaly = cnt > ANOMALY_THRESHOLD or (z is not None and z >= z_threshold)
             
             if is_anomaly:
-                anomalies.append((uid, ws.isoformat(), we.isoformat(), cnt, float(z) if z is not None else None))
-            
+                severity = "high" if z > 5 else "medium" if z > 3 else "low"
+                if severity in ["high", "medium"]:
+                    anomalies.append((uid, ws.isoformat(), we.isoformat(), cnt, float(z), severity, rows[i]["user_name"], rows[i]["region"]))
+
     # Persist anomalies (psycopg2) with ON CONFLICT DO NOTHING
         if anomalies:
             try:
                 conn = get_psycopg2_conn()
                 cur = conn.cursor()
-                anomaly_db_tuples = [(uid, ws_iso, we_iso, cnt) for (uid, ws_iso, we_iso, cnt, z) in anomalies]
+                anomaly_db_tuples = [(uid, ws_iso, we_iso, cnt) for (uid, ws_iso, we_iso, cnt, z, severity, _, _) in anomalies]
                 insert_anom_sql = """
                 INSERT INTO anomalous_events (user_id, window_start, window_end, event_count)
                 VALUES %s
@@ -461,7 +478,7 @@ def write_summary_and_anomaly(batch_df, batch_id):
             es = get_es_client()
             if es and anomalies:
                 docs = []
-                for (uid, ws_iso, we_iso, cnt, z) in anomalies:
+                for (uid, ws_iso, we_iso, cnt, z, user_name, region, severity) in anomalies:
                     docs.append({
                         "_index": ES_INDEX, 
                         "_source": {
@@ -471,39 +488,49 @@ def write_summary_and_anomaly(batch_df, batch_id):
                             "window_start": ws_iso, 
                             "window_end": we_iso, 
                             "z_score": z, 
+                            "severity": severity, 
+                            "user_name": user_name,
+                            "region": region,
                             "detected_at": datetime.utcnow().isoformat()
                         }
                     })
-                helpers.bulk(es, docs, chunk_size=200, raise_on_error=False)
+                helpers.bulk(es, docs, chunk_size=ES_BULK_CHUNK, raise_on_error=False)
                 logger.info("[ES] Bulk indexed %d anomalies", len(docs))
         except Exception as e:
             logger.exception("[ERROR] ES bulk index anomalies failed for batch %s: %s", batch_id, e)
         # Send alerts to Kafka alert topic (batch send & flush once)
         try:
             prod = get_alert_producer()
-            if prod is None:
-                logger.error("Kafka producer is not initialized, cannot send alerts")
-            elif anomalies:
-                for (uid, ws_iso, we_iso, cnt, z) in anomalies:
-                    alert_msg = {
-                        "user_id": uid,
-                        "window_start": ws_iso,
-                        "window_end": we_iso,
-                        "event_count": cnt,
-                        "z_score": z,
-                        "detected_at": datetime.utcnow().isoformat()
-                    }
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                if prod is None:
+                    logger.error("Kafka producer is not initialized, cannot send alerts")
+                elif anomalies:
+                    for (uid, ws_iso, we_iso, cnt, z, severity, user_name, region) in anomalies:
+                        alert_msg = {
+                            "user_id": uid,
+                            "user_name": user_name,
+                            "region": region,
+                            "window_start": ws_iso,
+                            "window_end": we_iso,
+                            "event_count": cnt,
+                            "z_score": z,
+                            "severity": severity,
+                            "detected_at": datetime.utcnow().isoformat()
+                        }
+                        print(f"[ALERT] {json.dumps(alert_msg)}")
+                        executor.submit(lambda msg=alert_msg: open("/tmp/alerts.log", "a").write(json.dumps(msg) + "\n"))
+                        try:
+                            prod.send(KAFKA_ALERT_TOPIC, alert_msg)
+                        except Exception as e:
+                            logger.warning("[Kafka] Failed sending alert for anomaly: %s", e)
                     try:
-                        prod.send(KAFKA_ALERT_TOPIC, alert_msg)
+                        prod.flush(timeout=5)
+                        logger.info("[Kafka] Sent %d anomaly alerts to %s", len(anomalies), KAFKA_ALERT_TOPIC)
                     except Exception as e:
-                        logger.warning("[Kafka] Failed sending alert for anomaly: %s", e)
-                try:
-                    prod.flush(timeout=5)
-                    logger.info("[Kafka] Sent %d anomaly alerts to %s", len(anomalies), KAFKA_ALERT_TOPIC)
-                except Exception as e:
-                    logger.warning("[Kafka] Failed flushing alerts: %s", e)
-            else:
-                logger.info("[Kafka] No anomalies to send alerts")
+                        logger.warning("[Kafka] Failed flushing alerts: %s", e)
+                else:
+                    logger.info("[Kafka] No anomalies to send alerts")
+            
         except Exception as e:
             logger.exception("[ERROR] Failed sending alerts to Kafka: %s", e)
         
@@ -514,6 +541,7 @@ def write_summary_and_anomaly(batch_df, batch_id):
                 summary_doc ={
                     "type": "agg_batch",
                     "batch_id": batch_id,
+                    "window_type": window_type,
                     "records": len(upsert_tuples),
                     "anomalies": len(anomalies),
                     "mean_event_count": mean,
@@ -528,12 +556,19 @@ def write_summary_and_anomaly(batch_df, batch_id):
         except Exception as e:
             logger.exception("[ERROR] Failed logging agg batch summary to ES: %s", e)
     except Exception as e:
-        logger.exception("[ERROR] write_summary_and_anomaly exception for batch %s: %s", batch_id, e)    
+        logger.exception("[ERROR] write_summary_and_anomaly exception for batch %s: %s", batch_id, window_type, e)
 # Start windowed stream
-agg_query = windowed.writeStream \
+agg_query_5s = windowed_5s.writeStream \
     .outputMode("update") \
-    .foreachBatch(write_summary_and_anomaly) \
-    .option("checkpointLocation", f"{CHECKPOINT_BASE}/user_activity_summary") \
+    .foreachBatch(lambda df, id: write_summary_and_anomaly(df, id, "5s")) \
+    .option("checkpointLocation", f"{CHECKPOINT_BASE}/user_activity_summary_5s") \
+    .trigger(processingTime=PROCESSING_TRIGGER) \
+    .start()
+
+agg_query_1min = windowed_1min.writeStream \
+    .outputMode("update") \
+    .foreachBatch(lambda df, id: write_summary_and_anomaly(df, id, "1min")) \
+    .option("checkpointLocation", f"{CHECKPOINT_BASE}/user_activity_summary_1min") \
     .trigger(processingTime=PROCESSING_TRIGGER) \
     .start()
 

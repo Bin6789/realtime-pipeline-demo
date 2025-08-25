@@ -10,6 +10,7 @@ try:
         bootstrap_servers='localhost:9093',  # Adjust the port if necessary 
         value_serializer=lambda v: json.dumps(v).encode('utf-8'),
         retries=5,
+        compression_type='snappy',
         max_block_ms=10000
     )
 except KafkaError as e:
@@ -28,44 +29,36 @@ def generate_ip():
 
 SPAM_USERS = [10, 455, 789, 123, 999]  # Giả sử đây là những người dùng spammer
 
+def generate_event():
+    is_spammer = random.random() < 0.4  # 40% xác suất là spammer
+    user_id = random.choice(SPAM_USERS) if is_spammer else random.choice(user_ids)
+    return {
+        'user_id': user_id,
+        'product_id': random.choice(product_ids),
+        'action': 'click' if is_spammer else random.choice(actions),
+        'timestamp': datetime.utcnow().isoformat(),
+        'device_id': f"device_{random.randint(10000,99999)}",
+        'device_type': random.choice(device_types),
+        'location': random.choice(locations),
+        'user_segment': 'promo_hunter' if is_spammer else random.choice(user_segments),
+        'ip_address': generate_ip()
+    }
+batch_size = 1000
+batch = []
+start_time = time.time()
 while True:
     try:
-        # 80% xác suất là spammer thực hiện "click", còn lại là user ngẫu nhiên
-        if random.random() < 0.8:
-            spam_user = random.choice(SPAM_USERS)
-            event = {
-                'user_id': spam_user,
-                'product_id': random.choice(product_ids),
-                'action': 'click',
-                'timestamp': datetime.utcnow().isoformat(),
-                'device_id': f"device_{random.randint(10000,99999)}",
-                'device_type': random.choice(device_types),
-                'location': random.choice(locations),
-                'user_segment': 'promo_hunter',
-                'ip_address': generate_ip()
-            }
-            interval = 0.5  # spam mỗi 500ms
-        else:
-            event = {
-                'user_id': random.choice(user_ids),
-                'product_id': random.choice(product_ids),
-                'action': random.choice(actions),
-                'timestamp': datetime.utcnow().isoformat(),
-                'device_id': f"device_{random.randint(10000,99999)}",
-                'device_type': random.choice(device_types),
-                'location': random.choice(locations),
-                'user_segment': random.choice(user_segments),
-                'ip_address': generate_ip()
-            }
-            interval = 2  # user bình thường mỗi 2 giây
-
-        future = producer.send('user_events', value=event)
-        result = future.get(timeout=10)  # Chờ tối đa 10 giây để gửi
-        if result:
-            print(f"Đã gửi sự kiện: {event['action']} từ người dùng {event['user_id']} vào lúc {event['timestamp']}")
-        else:
-            print("Không có kết quả trả về từ Kafka.")
-        time.sleep(interval)
+        batch.append(generate_event())
+        if len(batch) >= batch_size:
+            for event in batch:
+                future = producer.send('user_events', value=event)
+                future.get(timeout=10)  # Chờ tối đa 10 giây để gửi
+            producer.flush()    
+            elapsed = time.time() - start_time
+            print(f"Đã gửi {len(batch)} sự kiện trong {elapsed:.2f}s giây (~{len(batch) / elapsed:.2f} sự kiện/giây)")
+            batch = []
+            start_time = time.time()
+            time.sleep(0.1)
     except KafkaError as e:
         print(f"Lỗi khi gửi message: {e}")
-    time.sleep(1)
+    time.sleep(0.1)

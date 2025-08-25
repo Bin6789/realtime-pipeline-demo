@@ -8,6 +8,7 @@ jars/
 # ignore Spark & Kafka checkpoints
 checkpoint/
 logs/
+tmp/
 
 # ignore docker volumes or temp files
 *.db

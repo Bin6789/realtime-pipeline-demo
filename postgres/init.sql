@@ -31,3 +31,15 @@ CREATE TABLE user_activity_summary (
     event_count INTEGER NOT NULL,
     UNIQUE (user_id, window_start, window_end)
 );
+
+-- Bảng users cho enrich
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL UNIQUE,
+    name VARCHAR(100),
+    email VARCHAR(100),
+    region VARCHAR(50),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+
